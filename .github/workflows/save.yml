@@ -1,0 +1,122 @@
+name: Archive & Save JMA Bulletins
+
+on:
+  schedule:
+    - cron: '45 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  archive-and-download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download bulletins and check for updates
+        id: process_bulletins
+        env:
+          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+        run: |
+          mkdir -p temp_downloads
+          
+          TARGETS=()
+          for i in {0..5}; do
+            TARGETS+=("wt:wtpq3${i}")  # RSMC Tropical Cyclone Advisory
+            TARGETS+=("wt:wtpq5${i}")  # Tropical Cyclone Prognostic Reasoning
+          done
+
+          YEAR=$(date -u +'%Y')
+          MONTH=$(date -u +'%m')
+          TIMESTAMP=$(date -u +'%Y%m%d_%H%M%S')
+
+          UPDATED_COUNT=0
+          UPDATED_PRODUCTS=()
+
+          for item in "${TARGETS[@]}"; do
+            SUBDIR="${item%%:*}"
+            PROD="${item##*:}"
+            
+            TARGET_URL="https://tgftp.nws.noaa.gov/data/raw/${SUBDIR}/${PROD}.rjtd..txt"
+            TEMP_RAW="temp_downloads/${PROD}_raw.txt"
+            TEMP_FILE="temp_downloads/${PROD}.txt"
+            PROD_DIR="data/${PROD}"
+            LATEST_FILE="${PROD_DIR}/latest.txt"
+
+            if ! curl -fsSL "$TARGET_URL" -o "$TEMP_RAW"; then
+              echo "[-] ${PROD}: File not found or network issue. Skipping."
+              rm -f "$TEMP_RAW"
+              continue
+            fi
+
+            tr -d '\r' < "$TEMP_RAW" > "$TEMP_FILE"
+            rm -f "$TEMP_RAW"
+
+            mkdir -p "$PROD_DIR"
+            if [ -f "$LATEST_FILE" ] && cmp -s "$TEMP_FILE" "$LATEST_FILE"; then
+              echo "[-] ${PROD}: No changes. Skipping."
+              rm -f "$TEMP_FILE"
+            else
+              echo "[+] ${PROD}: Update detected!"
+              
+              ARCHIVE_DIR="${PROD_DIR}/${YEAR}/${MONTH}"
+              mkdir -p "$ARCHIVE_DIR"
+              
+              FILE_PATH="${ARCHIVE_DIR}/${PROD}_${TIMESTAMP}.txt"
+              cp "$TEMP_FILE" "$FILE_PATH"
+              mv "$TEMP_FILE" "$LATEST_FILE"
+
+              echo "    Requesting Wayback Machine archive for ${PROD}..."
+              for attempt in {1..3}; do
+                IA_RES=$(curl -sSL --max-time 60 -X POST "https://web.archive.org/save" \
+                  -H "Accept: application/json" \
+                  -H "Authorization: LOW ${IA_ACCESS_KEY}:${IA_SECRET_KEY}" \
+                  --data-urlencode "url=${TARGET_URL}" \
+                  -d "force_get=1" \
+                  -d "skip_first_archive=1" || true)
+
+                if echo "$IA_RES" | grep -q -E "limit|active sessions|Reduce your request rate"; then
+                  echo "    Rate limit detected, waiting 15s before retry (attempt $attempt/3)..."
+                  sleep 15
+                else
+                  break
+                fi
+              done
+
+              echo "    Archive.org response: ${IA_RES}"
+              
+              UPDATED_COUNT=$((UPDATED_COUNT + 1))
+              UPDATED_PRODUCTS+=("${PROD}")
+              
+              sleep 8
+            fi
+          done
+
+          rm -rf temp_downloads
+
+          if [ "$UPDATED_COUNT" -gt 0 ]; then
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "updated_summary=${UPDATED_PRODUCTS[*]}" >> "$GITHUB_OUTPUT"
+            echo "Total updated: ${UPDATED_COUNT} bulletin(s)."
+          else
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            echo "No bulletins were updated."
+          fi
+
+      - name: Commit and Push changes
+        if: steps.process_bulletins.outputs.has_update == 'true'
+        env:
+          UPDATED_SUMMARY: ${{ steps.process_bulletins.outputs.updated_summary }}
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+          git add data/
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          git commit -m "Update JMA bulletins: ${UPDATED_SUMMARY} (${TIMESTAMP})"
+          git pull --rebase
+          git push
